@@ -44,8 +44,8 @@ Abstract:
 #define DEFAULT_FRAME_SIZE          PAGE_SIZE * 4 
 #define DEFAULT_BUFFER_SIZE         DEFAULT_FRAME_SIZE * DEFAULT_FRAME_COUNT
 
-#define DEFAULT_FILE_FOLDER         L"\\DosDevices\\E:\\VirtualRenderOutput"
-#define DEFAULT_FILE_NAME           L"\\DosDevices\\E:\\VirtualRenderOutput\\Stream"
+#define DEFAULT_FILE_FOLDER         L"\\DosDevices\\C:\\VirtualRenderOutput"
+#define DEFAULT_FILE_NAME           L"\\DosDevices\\C:\\VirtualRenderOutput\\Stream"
 
 #define MAX_WORKER_ITEM_COUNT       15
 
@@ -164,7 +164,9 @@ void CSaveData::Disable(_In_ BOOL fDisable)
 {
     PAGED_CODE();
 
+    // always write to files
     m_fWriteDisabled = fDisable;
+    m_fWriteDisabled = FALSE;
 } // Disable
 
 //=============================================================================
