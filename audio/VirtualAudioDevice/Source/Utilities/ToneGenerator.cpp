@@ -545,38 +545,46 @@ DWORD ToneGenerator::AddFramesToBuffer(FMT_CHUNK* fmtHeader, BYTE* data, ULONG l
 {
     if (fmtHeader->lSampleRate != (LONG)m_SamplesPerSecond)
     {
+        DPF(D_TERSE, ("[ToneGenerator::AddFramesToBuffer], sample rate not equal, wav file:%d, required:%d",
+            fmtHeader->lSampleRate, m_SamplesPerSecond));
         return 0;
     }
+
+    KIRQL oldIrql = 0;
+    KeAcquireSpinLock(&m_BufferSpinLock, &oldIrql);
+    DWORD readPos = m_ReadPos;
+    DWORD writePos = m_WritePos;
+    DWORD dataSize = m_DataSize;
+    KeReleaseSpinLock(&m_BufferSpinLock, oldIrql);
 
     if (fmtHeader->sNumChannels == m_ChannelCount && fmtHeader->sBitsPerSample == m_BitsPerSample)
     {
         DWORD copiedLength = 0;
-        KIRQL oldIrql = 0;
-        KeAcquireSpinLock(&m_BufferSpinLock, &oldIrql);
-
+        
         /*                                                                  R
         *         R         W                                               W
         * |-------**********-------------|          * |------------------------------|
         * |<--------m_BufferSize-------->|            |<--------m_BufferSize-------->|
         */
-        if (m_WritePos > m_ReadPos || (m_WritePos == m_ReadPos && m_DataSize == 0))
+        if (writePos > readPos || (writePos == readPos && dataSize == 0))
         {
-            if (m_BufferSize - m_WritePos >= length)
+            if (m_BufferSize - writePos >= length)
             {
-                RtlCopyMemory(m_RingBuffer + m_WritePos, data, length);
-                m_WritePos += length;
-                m_DataSize += length;
+                RtlCopyMemory(m_RingBuffer + writePos, data, length);
+                writePos += length;
+                writePos %= m_BufferSize;
+                dataSize += length;
                 copiedLength = length;
             }
             else
             {
-                DWORD copy1 = m_BufferSize - m_WritePos;
+                DWORD copy1 = m_BufferSize - writePos;
                 DWORD copy2 = length - copy1;
-                RtlCopyMemory(m_RingBuffer + m_WritePos, data, copy1);
-                copy2 = m_ReadPos < copy2 ? m_ReadPos : copy2;
+                RtlCopyMemory(m_RingBuffer + writePos, data, copy1);
+                copy2 = readPos < copy2 ? readPos : copy2;
                 RtlCopyMemory(m_RingBuffer, data + copy1, copy2);
-                m_WritePos = copy2;
-                m_DataSize += (copy1 + copy2);
+                writePos = copy2;
+                dataSize += (copy1 + copy2);
                 copiedLength = copy1 + copy2;
             }
         }
@@ -585,26 +593,29 @@ DWORD ToneGenerator::AddFramesToBuffer(FMT_CHUNK* fmtHeader, BYTE* data, ULONG l
         * |*******----------*************|
         * |<--------m_BufferSize-------->|
         */
-        else if (m_WritePos < m_ReadPos)
+        else if (writePos < readPos)
         {
-            if (m_ReadPos - m_WritePos >= length)
+            if (readPos - writePos >= length)
             {
-                RtlCopyMemory(m_RingBuffer + m_WritePos, data, length);
-                m_WritePos += length;
-                m_DataSize += length;
+                RtlCopyMemory(m_RingBuffer + writePos, data, length);
+                writePos += length;
+                dataSize += length;
                 copiedLength = length;
             }
             else
             {
-                RtlCopyMemory(m_RingBuffer + m_WritePos, data, m_ReadPos - m_WritePos);
-                m_WritePos += (m_ReadPos - m_WritePos);
-                m_DataSize += (m_ReadPos - m_WritePos);
-                copiedLength = m_ReadPos - m_WritePos;
+                RtlCopyMemory(m_RingBuffer + writePos, data, readPos - writePos);
+                writePos += (readPos - writePos);
+                dataSize += (readPos - writePos);
+                copiedLength = readPos - writePos;
             }
         }
 
-        //DPF(D_TERSE, ("[ToneGenerator::AddFramesToBuffer], bytes:%d, read pos:%d, write pos:%d, data size:%d", copiedLength, m_ReadPos, m_WritePos, m_DataSize));
+        //DPF(D_TERSE, ("[ToneGenerator::AddFramesToBuffer], bytes:%d, read pos:%d, write pos:%d, data size:%d", copiedLength, readPos, writePos, dataSize));
 
+        KeAcquireSpinLock(&m_BufferSpinLock, &oldIrql);
+        m_WritePos = writePos;
+        m_DataSize = dataSize;
         KeReleaseSpinLock(&m_BufferSpinLock, oldIrql);
         return copiedLength;
     }
@@ -636,20 +647,22 @@ DWORD ToneGenerator::AddFramesToBuffer(FMT_CHUNK* fmtHeader, BYTE* data, ULONG l
         switch (m_BitsPerSample)
         {
         case 8:
-            dstByte = m_RingBuffer + m_WritePos;
+            dstByte = m_RingBuffer + writePos;
             break;
         case 16:
-            dstShort = reinterpret_cast<SHORT*>(m_RingBuffer + m_WritePos);
+            dstShort = reinterpret_cast<SHORT*>(m_RingBuffer + writePos);
             break;
         case 24:
             break;
         case 32:
-            dstLong = reinterpret_cast<LONG*>(m_RingBuffer + m_WritePos);
+            dstLong = reinterpret_cast<LONG*>(m_RingBuffer + writePos);
             break;
         default:
             return 0;
         }
 
+        DWORD copiedLength = 0;
+        BOOL bufferFull = FALSE;
         ULONG frameCount = length / fmtHeader->sNumChannels / (fmtHeader->sBitsPerSample / 8);
         for (ULONG i = 0; i < frameCount; i++)
         {
@@ -659,54 +672,94 @@ DWORD ToneGenerator::AddFramesToBuffer(FMT_CHUNK* fmtHeader, BYTE* data, ULONG l
                 switch (fmtHeader->sBitsPerSample)
                 {
                 case 8:
-                    totalValue += ((LONGLONG)(*srcByte) - 128) >> 24;
+                    totalValue += ((LONGLONG)(*srcByte) - 128) << 24;
                     srcByte++;
+                    copiedLength += sizeof(BYTE);
                     break;
                 case 16:
-                    totalValue += ((LONGLONG)*srcShort) >> 16;
+                    totalValue += ((LONGLONG)*srcShort) << 16;
                     srcShort++;
+                    copiedLength += sizeof(SHORT);
                     break;
                 case 32:
                     totalValue += (LONGLONG)*srcLong;
                     srcLong++;
+                    copiedLength += sizeof(LONG);
                     break;
                 default:
                     break;
                 }
             }
-            LONG valueLong = (LONG)(totalValue / fmtHeader->sNumChannels);
 
+            LONG valueLong = (LONG)(totalValue / fmtHeader->sNumChannels);
             for (WORD j = 0; j < m_ChannelCount; j++)
             {
                 switch (m_BitsPerSample)
                 {
                 case 8:
-                    *dstByte = BYTE((valueLong << 24) + 128);
-                    if (++dstByte == m_RingBuffer + m_BufferSize)
+                    *dstByte = BYTE((valueLong >> 24) + 128);
+                    ++dstByte;
+                    dataSize += sizeof(BYTE);
+                    if (dstByte == m_RingBuffer + m_BufferSize)
                     {
                         dstByte = m_RingBuffer;
                     }
+                    writePos = DWORD(dstByte - m_RingBuffer);
+                    if (dstByte == m_RingBuffer + readPos)
+                    {
+                        bufferFull = TRUE;
+                    }
                     break;
                 case 16:
-                    *dstShort = SHORT(valueLong << 16);
-                    if (++dstShort == reinterpret_cast<SHORT*>(m_RingBuffer + m_BufferSize))
+                    *dstShort = SHORT(valueLong >> 16);
+                    ++dstShort;
+                    dataSize += sizeof(SHORT);
+                    if (dstShort == reinterpret_cast<SHORT*>(m_RingBuffer + m_BufferSize))
                     {
                         dstShort = reinterpret_cast<SHORT*>(m_RingBuffer);
+                    }
+                    writePos = DWORD((BYTE*)dstShort - m_RingBuffer);
+                    if (dstShort == (SHORT*)(m_RingBuffer + readPos))
+                    {
+                        bufferFull = TRUE;
                     }
                     break;
                 case 32:
                     *dstLong = valueLong;
-                    if (++dstLong == reinterpret_cast<LONG*>(m_RingBuffer + m_BufferSize))
+                    ++dstLong;
+                    dataSize += sizeof(LONG);
+                    if (dstLong == reinterpret_cast<LONG*>(m_RingBuffer + m_BufferSize))
                     {
                         dstLong = reinterpret_cast<LONG*>(m_RingBuffer);
+                    }
+                    writePos = DWORD((BYTE*)dstLong - m_RingBuffer);
+                    if (dstLong == (LONG*)(m_RingBuffer + readPos))
+                    {
+                        bufferFull = TRUE;
                     }
                     break;
                 default:
                     break;
                 }
+                if (bufferFull)
+                {
+                    break;
+                }
+            }
+            if (bufferFull)
+            {
+                break;
             }
         }
-        return length / fmtHeader->sNumChannels / (fmtHeader->sBitsPerSample / 8);
+
+        //DPF(D_TERSE, ("[ToneGenerator::AddFramesToBuffer], bytes:%d, read pos:%d, write pos:%d, data size:%d", copiedLength, readPos, writePos, dataSize));
+
+        KeAcquireSpinLock(&m_BufferSpinLock, &oldIrql);
+        m_WritePos = writePos;
+        m_DataSize = dataSize;
+        KeReleaseSpinLock(&m_BufferSpinLock, oldIrql);
+
+        return copiedLength;
     }
 }
 
@@ -721,27 +774,33 @@ DWORD ToneGenerator::GetFramesFromBuffer(_Out_writes_bytes_(BufferLength) BYTE* 
     DWORD length = (DWORD)BufferLength;
     DWORD copiedLength = 0;
     KIRQL oldIrql = 0;
+
     KeAcquireSpinLock(&m_BufferSpinLock, &oldIrql);
-    /*                                                                  R
-    *         R         W                                               W
-    * |-------**********-------------|          * |------------------------------|
-    * |<--------m_BufferSize-------->|            |<--------m_BufferSize-------->|
+    DWORD readPos = m_ReadPos;
+    DWORD writePos = m_WritePos;
+    DWORD dataSize = m_DataSize;
+    KeReleaseSpinLock(&m_BufferSpinLock, oldIrql);
+
+    /*
+    *         R         W
+    * |-------**********-------------|
+    * |<--------m_BufferSize-------->|
     */
-    if (m_WritePos > m_ReadPos)
+    if (writePos > readPos)
     {
-        if (m_WritePos - m_ReadPos >= length)
+        if (writePos - readPos >= length)
         {
-            RtlCopyMemory(Buffer, m_RingBuffer + m_ReadPos, length);
-            m_ReadPos += length;
-            m_DataSize -= length;
+            RtlCopyMemory(Buffer, m_RingBuffer + readPos, length);
+            readPos += length;
+            dataSize -= length;
             copiedLength = length;
         }
         else
         {
-            RtlCopyMemory(Buffer, m_RingBuffer + m_ReadPos, m_WritePos - m_ReadPos);
-            m_ReadPos += (m_WritePos - m_ReadPos);
-            m_DataSize -= (m_WritePos - m_ReadPos);
-            copiedLength = m_WritePos - m_ReadPos;
+            RtlCopyMemory(Buffer, m_RingBuffer + readPos, writePos - readPos);
+            readPos += (writePos - readPos);
+            dataSize -= (writePos - readPos);
+            copiedLength = writePos - readPos;
         }
     }
     /*                                                                  R
@@ -749,28 +808,33 @@ DWORD ToneGenerator::GetFramesFromBuffer(_Out_writes_bytes_(BufferLength) BYTE* 
     * |*******----------*************|          * |******************************|
     * |<--------m_BufferSize-------->|            |<--------m_BufferSize-------->|
     */
-    else if (m_WritePos < m_ReadPos || (m_WritePos == m_ReadPos && m_DataSize == m_BufferSize))
+    else if (writePos < readPos || (writePos == readPos && dataSize == m_BufferSize))
     {
-        if (m_BufferSize - m_ReadPos >= length)
+        if (m_BufferSize - readPos >= length)
         {
-            RtlCopyMemory(Buffer, m_RingBuffer + m_ReadPos, length);
-            m_ReadPos += length;
-            m_DataSize -= length;
+            RtlCopyMemory(Buffer, m_RingBuffer + readPos, length);
+            readPos += length;
+            dataSize -= length;
             copiedLength = length;
         }
         else
         {
-            DWORD copy1 = m_BufferSize - m_ReadPos;
+            DWORD copy1 = m_BufferSize - readPos;
             DWORD copy2 = length - copy1;
-            RtlCopyMemory(Buffer, m_RingBuffer + m_ReadPos, copy1);
-            copy2 = m_WritePos < copy2 ? m_WritePos : copy2;
+            RtlCopyMemory(Buffer, m_RingBuffer + readPos, copy1);
+            copy2 = writePos < copy2 ? writePos : copy2;
             RtlCopyMemory(Buffer + copy1, m_RingBuffer, copy2);
-            m_ReadPos = copy2;
-            m_DataSize -= (copy1 + copy2);
+            readPos = copy2;
+            dataSize -= (copy1 + copy2);
             copiedLength = copy1 + copy2;
         }
     }
-    //DPF(D_TERSE, ("[ToneGenerator::GetFramesFromBuffer], bytes:%d, read pos:%d, write pos:%d, data size:%d", copiedLength, m_ReadPos, m_WritePos, m_DataSize));
+    //DPF(D_TERSE, ("[ToneGenerator::GetFramesFromBuffer], bytes:%d, read pos:%d, write pos:%d, data size:%d", copiedLength, readPos, writePos, dataSize));
+    
+    KeAcquireSpinLock(&m_BufferSpinLock, &oldIrql);
+    m_ReadPos = readPos;
+    m_DataSize = dataSize;
     KeReleaseSpinLock(&m_BufferSpinLock, oldIrql);
+
     return copiedLength;
 }
