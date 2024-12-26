@@ -11,8 +11,12 @@ Abstract:
     Implementation of Simple Audio Sample sine wave generator
 
 --*/
+#pragma warning (disable : 4127)
+
 #include "definitions.h"
 #include "ToneGenerator.h"
+
+#define DEFAULT_READ_FRAME_COUNT         1024
 
 const double TWO_PI = M_PI * 2;
 
@@ -43,6 +47,160 @@ unsigned char ConvertToUChar(double Value)
     return (unsigned char)(Value * F_127_5 + F_127_5);
 };
 
+VOID ReadWaveFile(PVOID context)
+{
+    ToneGenerator* generator = reinterpret_cast<ToneGenerator*>(context);
+
+    HANDLE fileHandle = nullptr;
+    OBJECT_ATTRIBUTES objectAttributes;
+    IO_STATUS_BLOCK ioStatusBlock;
+    UNICODE_STRING fileName;
+    NTSTATUS status;
+
+    RtlInitUnicodeString(&fileName, L"\\DosDevices\\C:\\1.wav");
+    InitializeObjectAttributes(&objectAttributes, &fileName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+    status = ZwCreateFile(&fileHandle, GENERIC_READ, &objectAttributes, &ioStatusBlock, NULL, FILE_ATTRIBUTE_NORMAL,
+        FILE_SHARE_READ, FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+    if (!NT_SUCCESS(status))
+    {
+        DPF(D_TERSE, ("[ReadWaveFile], file not found"));
+        PsTerminateSystemThread(STATUS_SUCCESS);
+        return;
+    }
+    
+    ULONG headError = 0;
+    FMT_CHUNK fmtChunk = { 0 };
+    LARGE_INTEGER offset = { 0 };
+    while (1)
+    {
+        CHUNK_HEADER chunkHeader = { 0 };
+        status = ZwReadFile(fileHandle, NULL, NULL, NULL, &ioStatusBlock, &chunkHeader, sizeof(chunkHeader), &offset, NULL);
+        if (!NT_SUCCESS(status) || ioStatusBlock.Information != sizeof(chunkHeader))
+        {
+            headError = TRUE;
+            break;
+        }
+        offset.QuadPart += (ULONG)ioStatusBlock.Information;
+        
+        if (memcmp(chunkHeader.szId, "RIFF", 4) == 0)
+        {
+            offset.QuadPart += 4;
+        }
+        else if (memcmp(chunkHeader.szId, "fmt ", 4) == 0)
+        {
+            status = ZwReadFile(fileHandle, NULL, NULL, NULL, &ioStatusBlock, &fmtChunk, sizeof(fmtChunk), &offset, NULL);
+            if (!NT_SUCCESS(status) || ioStatusBlock.Information != sizeof(fmtChunk))
+            {
+                headError = TRUE;
+                break;
+            }
+            offset.QuadPart += (ULONG)chunkHeader.lSize;
+        }
+        else if (memcmp(chunkHeader.szId, "data", 4) == 0)
+        {
+            break;
+        }
+        else
+        {
+            offset.QuadPart += (ULONG)chunkHeader.lSize;
+        }
+    }
+    
+    if (headError)
+    {
+        DPF(D_TERSE, ("[ReadWaveFile], read header error"));
+        ZwClose(fileHandle);
+        PsTerminateSystemThread(STATUS_SUCCESS);
+        return;
+    }
+
+    DPF(D_TERSE, ("[ReadWaveFile], sampleRate:%d, channel:%d, bits:%d", fmtChunk.lSampleRate, fmtChunk.sNumChannels, fmtChunk.sBitsPerSample));
+
+    ULONG frameSize = fmtChunk.sNumChannels * fmtChunk.sBitsPerSample / 8;
+    ULONG bufLen = DEFAULT_READ_FRAME_COUNT * frameSize;
+    PBYTE pDataBuffer = (PBYTE)ExAllocatePool2(POOL_FLAG_NON_PAGED, bufLen, VIRTUALAUDIODEVICE_POOLTAG);
+    if (!pDataBuffer)
+    {
+        DPF(D_TERSE, ("[Could not allocate memory for Reading Data]"));
+        ZwClose(fileHandle);
+        PsTerminateSystemThread(STATUS_SUCCESS);
+        return;
+    }
+
+    LONGLONG headLength = offset.QuadPart;
+    while (!generator->m_Stop)
+    {
+        if (generator->GetFreeFrameCount() >= DEFAULT_READ_FRAME_COUNT)
+        {
+            status = ZwReadFile(fileHandle, NULL, NULL, NULL, &ioStatusBlock, pDataBuffer, bufLen, &offset, NULL);
+            if (status == STATUS_END_OF_FILE)
+            {
+                offset.QuadPart = headLength;
+                continue;
+            }
+            else if (!NT_SUCCESS(status))
+            {
+                DPF(D_TERSE, ("[ReadWaveFile], read failed, bytes:%d", (ULONG)ioStatusBlock.Information));
+                break;
+            }
+
+            ULONG bytesRead = (ULONG)ioStatusBlock.Information;
+            if (bytesRead == 0)
+            {
+                DPF(D_TERSE, ("[ReadWaveFile], read failed, 0 bytes"));
+                break;
+            }
+
+            if (bytesRead % frameSize)
+            {
+                bytesRead = bytesRead / frameSize * frameSize;
+            }
+
+            offset.QuadPart += bytesRead;
+
+            // indicate the float value
+            if (fmtChunk.sAudioFormat == 3)
+            {
+                for (ULONG i = 0; i < bytesRead; i += 4)
+                {
+                    FLOAT fValue = 0.0;
+                    RtlCopyMemory(&fValue, pDataBuffer + i, 4);
+                    LONG iValue = (LONG)(fValue * _I32_MAX);
+                    RtlCopyMemory(pDataBuffer + i, &iValue, 4);
+                }
+            }
+
+            generator->AddFramesToBuffer(&fmtChunk, pDataBuffer, bytesRead);
+        }
+
+        LARGE_INTEGER Interval;
+        NTSTATUS Status;
+        // Sleep a little bit (100 nanoseconds unit)
+        Interval.QuadPart = -100000;
+
+        // Put the thread to sleep
+        Status = KeDelayExecutionThread(KernelMode, FALSE, &Interval);
+
+        if (NT_SUCCESS(Status))
+        {
+            // The thread successfully slept for the specified interval
+        }
+        else
+        {
+            // Handle the error
+        }
+    }
+
+    ZwClose(fileHandle);
+
+    ExFreePoolWithTag(pDataBuffer, VIRTUALAUDIODEVICE_POOLTAG);
+    pDataBuffer = NULL;
+
+    // Terminate the thread when done
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
 //
 // Ctor: basic init.
 //
@@ -58,6 +216,8 @@ ToneGenerator::ToneGenerator()
 {
     // Theta (double) and SampleIncrement (double) are init in the Init() method 
     // after saving the floating point state. 
+
+    KeInitializeSpinLock(&m_BufferSpinLock);
 }
 
 //
@@ -71,6 +231,16 @@ ToneGenerator::~ToneGenerator()
         m_PartialFrame = NULL;
         m_PartialFrameBytes = 0;
     }
+
+    m_Stop = true;
+    if (m_ThreadObject)
+    {
+        // Wait for the thread to terminate
+        KeWaitForSingleObject(m_ThreadObject, Executive, KernelMode, FALSE, NULL);
+
+        // Dereference the thread object
+        ObDereferenceObject(m_ThreadObject);
+    }
 }
 
 // 
@@ -81,11 +251,7 @@ ToneGenerator::~ToneGenerator()
 // Caller wraps this routine between KeSaveFloatingPointState/KeRestoreFloatingPointState calls.
 #pragma warning(disable: 28110)
 
-VOID ToneGenerator::InitNewFrame
-(
-    _Out_writes_bytes_(FrameSize)    BYTE* Frame,
-    _In_                             DWORD  FrameSize
-)
+VOID ToneGenerator::InitNewFrame(_Out_writes_bytes_(FrameSize)BYTE* Frame, _In_ DWORD FrameSize)
 {
     double sinValue = m_ToneDCOffset + m_ToneAmplitude * sin(m_Theta);
 
@@ -144,11 +310,7 @@ VOID ToneGenerator::InitNewFrame
 //  BufferLength - Length of the buffer.
 //
 //
-void ToneGenerator::GenerateSine
-(
-    _Out_writes_bytes_(BufferLength) BYTE* Buffer,
-    _In_                             size_t      BufferLength
-)
+void ToneGenerator::GenerateSine(_Out_writes_bytes_(BufferLength) BYTE* Buffer, _In_ size_t BufferLength)
 {
     NTSTATUS        status;
     KFLOATING_SAVE  saveData;
@@ -222,14 +384,8 @@ ZeroBuffer:
     return;
 }
 
-NTSTATUS ToneGenerator::Init
-(
-    _In_    DWORD                   ToneFrequency,
-    _In_    double                  ToneAmplitude,
-    _In_    double                  ToneDCOffset,
-    _In_    double                  ToneInitialPhase,
-    _In_    PWAVEFORMATEXTENSIBLE   WfExt
-)
+NTSTATUS ToneGenerator::Init(_In_ DWORD ToneFrequency, _In_ double ToneAmplitude,
+    _In_ double ToneDCOffset, _In_ double ToneInitialPhase, _In_ PWAVEFORMATEXTENSIBLE WfExt)
 {
     NTSTATUS        status = STATUS_SUCCESS;
     KFLOATING_SAVE  saveData;
@@ -267,6 +423,8 @@ NTSTATUS ToneGenerator::Init
     m_FrameSize = (DWORD)m_ChannelCount * m_BitsPerSample / 8;
     ASSERT(m_FrameSize == WfExt->Format.nBlockAlign);
 
+    DPF(D_TERSE, ("[ToneGenerator::Init], sampleRate:%d, channel:%d, bits:%d", m_SamplesPerSecond, m_ChannelCount, m_BitsPerSample));
+
     //
     // Restore floating state.
     //
@@ -275,16 +433,344 @@ NTSTATUS ToneGenerator::Init
     // 
     // Allocate a buffer to hold a partial frame.
     //
-    m_PartialFrame = (BYTE*)ExAllocatePool2(
-        POOL_FLAG_NON_PAGED,
-        m_FrameSize,
-        VIRTUALAUDIODEVICE_POOLTAG);
-
+    m_PartialFrame = (BYTE*)ExAllocatePool2(POOL_FLAG_NON_PAGED, m_FrameSize, VIRTUALAUDIODEVICE_POOLTAG);
     IF_TRUE_ACTION_JUMP(m_PartialFrame == NULL, status = STATUS_INSUFFICIENT_RESOURCES, Done);
 
-    status = STATUS_SUCCESS;
+    m_BufferSize = 4 * DEFAULT_READ_FRAME_COUNT * m_ChannelCount * m_BitsPerSample / 8;
+    m_RingBuffer = (BYTE*)ExAllocatePool2(POOL_FLAG_NON_PAGED, m_BufferSize, VIRTUALAUDIODEVICE_POOLTAG);
+    IF_TRUE_ACTION_JUMP(m_RingBuffer == NULL, status = STATUS_INSUFFICIENT_RESOURCES, Done);
+
+    HANDLE threadHandle = nullptr;
+    status = PsCreateSystemThread(&threadHandle, THREAD_ALL_ACCESS, NULL, NULL, NULL, ReadWaveFile, this);
+    if (NT_SUCCESS(status))
+    {
+        ObReferenceObjectByHandle(threadHandle, THREAD_ALL_ACCESS, *PsThreadType, KernelMode, (PVOID*)&m_ThreadObject, NULL);
+        ZwClose(threadHandle);
+    }
+    else
+    {
+        DPF(D_TERSE, ("[ToneGenerator::Init], PsCreateSystemThread failed"));
+    }
 
 Done:
     return status;
 }
 
+BOOL ToneGenerator::isBufferEmpty()
+{
+    BOOL ret = FALSE;
+    KIRQL oldIrql = 0;
+    KeAcquireSpinLock(&m_BufferSpinLock, &oldIrql);
+    if (m_DataSize == 0)
+    {
+        ret = TRUE;
+    }
+    KeReleaseSpinLock(&m_BufferSpinLock, oldIrql);
+    return ret;
+}
+
+BOOL ToneGenerator::isBufferFull()
+{
+    BOOL ret = FALSE;
+    KIRQL oldIrql = 0;
+    KeAcquireSpinLock(&m_BufferSpinLock, &oldIrql);
+    if (m_DataSize == m_BufferSize)
+    {
+        ret = TRUE;
+    }
+    KeReleaseSpinLock(&m_BufferSpinLock, oldIrql);
+    return ret;
+}
+
+//void addToBuffer(RingBuffer* rb, unsigned char data) {
+//    if (!isBufferFull(rb)) {
+//        rb->buffer[rb->head] = data;
+//        rb->head = (rb->head + 1) % BUFFER_SIZE;
+//        rb->size++;
+//    }
+//    else {
+//        printf("Buffer is full\n");
+//    }
+//}
+
+//unsigned char removeFromBuffer(RingBuffer* rb) {
+//    unsigned char data = 0;
+//    if (!isBufferEmpty(rb)) {
+//        data = rb->buffer[rb->tail];
+//        rb->tail = (rb->tail + 1) % BUFFER_SIZE;
+//        rb->size--;
+//    }
+//    else {
+//        printf("Buffer is empty\n");
+//    }
+//    return data;
+//}
+
+DWORD ToneGenerator::getUsedSize()
+{
+    return m_DataSize;
+}
+
+DWORD ToneGenerator::GetFrameAvailableCount()
+{
+    if (m_ChannelCount == 0 || m_BitsPerSample == 0)
+    {
+        return 0;
+    }
+
+    KIRQL oldIrql = 0;
+    KeAcquireSpinLock(&m_BufferSpinLock, &oldIrql);
+    DWORD availableCount = m_DataSize / m_ChannelCount / (m_BitsPerSample / 8);;
+    KeReleaseSpinLock(&m_BufferSpinLock, oldIrql);
+
+    return availableCount;
+}
+
+DWORD ToneGenerator::GetFreeFrameCount()
+{
+    if (m_ChannelCount == 0 || m_BitsPerSample == 0)
+    {
+        return 0;
+    }
+
+    KIRQL oldIrql = 0;
+    KeAcquireSpinLock(&m_BufferSpinLock, &oldIrql);
+    DWORD freeCount = (m_BufferSize - m_DataSize) / m_ChannelCount / (m_BitsPerSample / 8);
+    KeReleaseSpinLock(&m_BufferSpinLock, oldIrql);
+
+    return freeCount;
+}
+
+DWORD ToneGenerator::AddFramesToBuffer(FMT_CHUNK* fmtHeader, BYTE* data, ULONG length)
+{
+    if (fmtHeader->lSampleRate != (LONG)m_SamplesPerSecond)
+    {
+        return 0;
+    }
+
+    if (fmtHeader->sNumChannels == m_ChannelCount && fmtHeader->sBitsPerSample == m_BitsPerSample)
+    {
+        DWORD copiedLength = 0;
+        KIRQL oldIrql = 0;
+        KeAcquireSpinLock(&m_BufferSpinLock, &oldIrql);
+
+        /*                                                                  R
+        *         R         W                                               W
+        * |-------**********-------------|          * |------------------------------|
+        * |<--------m_BufferSize-------->|            |<--------m_BufferSize-------->|
+        */
+        if (m_WritePos > m_ReadPos || (m_WritePos == m_ReadPos && m_DataSize == 0))
+        {
+            if (m_BufferSize - m_WritePos >= length)
+            {
+                RtlCopyMemory(m_RingBuffer + m_WritePos, data, length);
+                m_WritePos += length;
+                m_DataSize += length;
+                copiedLength = length;
+            }
+            else
+            {
+                DWORD copy1 = m_BufferSize - m_WritePos;
+                DWORD copy2 = length - copy1;
+                RtlCopyMemory(m_RingBuffer + m_WritePos, data, copy1);
+                copy2 = m_ReadPos < copy2 ? m_ReadPos : copy2;
+                RtlCopyMemory(m_RingBuffer, data + copy1, copy2);
+                m_WritePos = copy2;
+                m_DataSize += (copy1 + copy2);
+                copiedLength = copy1 + copy2;
+            }
+        }
+        /*
+        *         W         R
+        * |*******----------*************|
+        * |<--------m_BufferSize-------->|
+        */
+        else if (m_WritePos < m_ReadPos)
+        {
+            if (m_ReadPos - m_WritePos >= length)
+            {
+                RtlCopyMemory(m_RingBuffer + m_WritePos, data, length);
+                m_WritePos += length;
+                m_DataSize += length;
+                copiedLength = length;
+            }
+            else
+            {
+                RtlCopyMemory(m_RingBuffer + m_WritePos, data, m_ReadPos - m_WritePos);
+                m_WritePos += (m_ReadPos - m_WritePos);
+                m_DataSize += (m_ReadPos - m_WritePos);
+                copiedLength = m_ReadPos - m_WritePos;
+            }
+        }
+
+        //DPF(D_TERSE, ("[ToneGenerator::AddFramesToBuffer], bytes:%d, read pos:%d, write pos:%d, data size:%d", copiedLength, m_ReadPos, m_WritePos, m_DataSize));
+
+        KeReleaseSpinLock(&m_BufferSpinLock, oldIrql);
+        return copiedLength;
+    }
+    else
+    {
+        BYTE* srcByte = nullptr;
+        SHORT* srcShort = nullptr;
+        LONG* srcLong = nullptr;
+        switch (fmtHeader->sBitsPerSample)
+        {
+        case 8:
+            srcByte = data;
+            break;
+        case 16:
+            srcShort = reinterpret_cast<SHORT*>(data);
+            break;
+        case 24:
+            break;
+        case 32:
+            srcLong = reinterpret_cast<LONG*>(data);
+            break;
+        default:
+            return 0;
+        }
+
+        BYTE* dstByte = nullptr;
+        SHORT* dstShort = nullptr;
+        LONG* dstLong = nullptr;
+        switch (m_BitsPerSample)
+        {
+        case 8:
+            dstByte = m_RingBuffer + m_WritePos;
+            break;
+        case 16:
+            dstShort = reinterpret_cast<SHORT*>(m_RingBuffer + m_WritePos);
+            break;
+        case 24:
+            break;
+        case 32:
+            dstLong = reinterpret_cast<LONG*>(m_RingBuffer + m_WritePos);
+            break;
+        default:
+            return 0;
+        }
+
+        ULONG frameCount = length / fmtHeader->sNumChannels / (fmtHeader->sBitsPerSample / 8);
+        for (ULONG i = 0; i < frameCount; i++)
+        {
+            LONGLONG totalValue = 0;
+            for (SHORT j = 0; j < fmtHeader->sNumChannels; j++)
+            {
+                switch (fmtHeader->sBitsPerSample)
+                {
+                case 8:
+                    totalValue += ((LONGLONG)(*srcByte) - 128) >> 24;
+                    srcByte++;
+                    break;
+                case 16:
+                    totalValue += ((LONGLONG)*srcShort) >> 16;
+                    srcShort++;
+                    break;
+                case 32:
+                    totalValue += (LONGLONG)*srcLong;
+                    srcLong++;
+                    break;
+                default:
+                    break;
+                }
+            }
+            LONG valueLong = (LONG)(totalValue / fmtHeader->sNumChannels);
+
+            for (WORD j = 0; j < m_ChannelCount; j++)
+            {
+                switch (m_BitsPerSample)
+                {
+                case 8:
+                    *dstByte = BYTE((valueLong << 24) + 128);
+                    if (++dstByte == m_RingBuffer + m_BufferSize)
+                    {
+                        dstByte = m_RingBuffer;
+                    }
+                    break;
+                case 16:
+                    *dstShort = SHORT(valueLong << 16);
+                    if (++dstShort == reinterpret_cast<SHORT*>(m_RingBuffer + m_BufferSize))
+                    {
+                        dstShort = reinterpret_cast<SHORT*>(m_RingBuffer);
+                    }
+                    break;
+                case 32:
+                    *dstLong = valueLong;
+                    if (++dstLong == reinterpret_cast<LONG*>(m_RingBuffer + m_BufferSize))
+                    {
+                        dstLong = reinterpret_cast<LONG*>(m_RingBuffer);
+                    }
+                    break;
+                default:
+                    break;
+                }
+            }
+        }
+        return length / fmtHeader->sNumChannels / (fmtHeader->sBitsPerSample / 8);
+    }
+}
+
+DWORD ToneGenerator::GetFramesFromBuffer(_Out_writes_bytes_(BufferLength) BYTE* Buffer, _In_ size_t BufferLength)
+{
+    if (m_ChannelCount == 0 || m_BitsPerSample / 8 == 0)
+    {
+        RtlZeroMemory(Buffer, BufferLength);
+        return 0;
+    }
+
+    DWORD length = (DWORD)BufferLength;
+    DWORD copiedLength = 0;
+    KIRQL oldIrql = 0;
+    KeAcquireSpinLock(&m_BufferSpinLock, &oldIrql);
+    /*                                                                  R
+    *         R         W                                               W
+    * |-------**********-------------|          * |------------------------------|
+    * |<--------m_BufferSize-------->|            |<--------m_BufferSize-------->|
+    */
+    if (m_WritePos > m_ReadPos)
+    {
+        if (m_WritePos - m_ReadPos >= length)
+        {
+            RtlCopyMemory(Buffer, m_RingBuffer + m_ReadPos, length);
+            m_ReadPos += length;
+            m_DataSize -= length;
+            copiedLength = length;
+        }
+        else
+        {
+            RtlCopyMemory(Buffer, m_RingBuffer + m_ReadPos, m_WritePos - m_ReadPos);
+            m_ReadPos += (m_WritePos - m_ReadPos);
+            m_DataSize -= (m_WritePos - m_ReadPos);
+            copiedLength = m_WritePos - m_ReadPos;
+        }
+    }
+    /*                                                                  R
+    *         W         R                                               W
+    * |*******----------*************|          * |******************************|
+    * |<--------m_BufferSize-------->|            |<--------m_BufferSize-------->|
+    */
+    else if (m_WritePos < m_ReadPos || (m_WritePos == m_ReadPos && m_DataSize == m_BufferSize))
+    {
+        if (m_BufferSize - m_ReadPos >= length)
+        {
+            RtlCopyMemory(Buffer, m_RingBuffer + m_ReadPos, length);
+            m_ReadPos += length;
+            m_DataSize -= length;
+            copiedLength = length;
+        }
+        else
+        {
+            DWORD copy1 = m_BufferSize - m_ReadPos;
+            DWORD copy2 = length - copy1;
+            RtlCopyMemory(Buffer, m_RingBuffer + m_ReadPos, copy1);
+            copy2 = m_WritePos < copy2 ? m_WritePos : copy2;
+            RtlCopyMemory(Buffer + copy1, m_RingBuffer, copy2);
+            m_ReadPos = copy2;
+            m_DataSize -= (copy1 + copy2);
+            copiedLength = copy1 + copy2;
+        }
+    }
+    //DPF(D_TERSE, ("[ToneGenerator::GetFramesFromBuffer], bytes:%d, read pos:%d, write pos:%d, data size:%d", copiedLength, m_ReadPos, m_WritePos, m_DataSize));
+    KeReleaseSpinLock(&m_BufferSpinLock, oldIrql);
+    return copiedLength;
+}

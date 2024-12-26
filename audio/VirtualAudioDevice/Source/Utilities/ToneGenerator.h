@@ -17,6 +17,22 @@ Abstract:
 #include <math.h>
 #include <limits.h>
 
+typedef struct _CHUNK_HEADER
+{
+    CHAR szId[4] = { 0 };
+    LONG lSize = 0;
+} CHUNK_HEADER;
+
+typedef struct _FMT_CHUNK
+{
+    SHORT sAudioFormat = 0;
+    SHORT sNumChannels = 0;
+    LONG lSampleRate = 0;
+    LONG lByteRate = 0;
+    SHORT sBlockAlign = 0;
+    SHORT sBitsPerSample = 0;
+} FMT_CHUNK;
+
 class ToneGenerator
 {
 public:
@@ -32,57 +48,39 @@ public:
     DWORD           m_FrameSize;
     double          m_ToneAmplitude;
     double          m_ToneDCOffset;
-    //HANDLE          m_FileRead = nullptr;
-    //HANDLE          m_FileWrite = nullptr;
-    //WAV_HEADER      m_WavHeader = { 0 };
-    //PETHREAD        m_ThreadObject = nullptr;
-    //bool            m_stop = false;
+    PETHREAD        m_ThreadObject = nullptr;
+    bool            m_Stop = false;
+    KSPIN_LOCK      m_BufferSpinLock;
+    
+    BYTE*           m_RingBuffer = nullptr;
+    DWORD           m_WritePos = 0;
+    DWORD           m_ReadPos = 0;
+    DWORD           m_DataSize = 0;
+    DWORD           m_BufferSize = 0;
 
 public:
     ToneGenerator();
     ~ToneGenerator();
     
-    NTSTATUS
-    Init
-    (
-        _In_    DWORD                   ToneFrequency, 
-        _In_    double                  ToneAmplitude,
-        _In_    double                  ToneDCOffset,
-        _In_    double                  ToneInitialPhase,
-        _In_    PWAVEFORMATEXTENSIBLE   WfExt
-    );
+    NTSTATUS Init(_In_ DWORD ToneFrequency, _In_ double ToneAmplitude, _In_ double ToneDCOffset, _In_ double ToneInitialPhase, _In_ PWAVEFORMATEXTENSIBLE WfExt);
     
-    VOID 
-    GenerateSine
-    (
-        _Out_writes_bytes_(BufferLength) BYTE       *Buffer, 
-        _In_                             size_t      BufferLength
-    );
+    VOID GenerateSine(_Out_writes_bytes_(BufferLength) BYTE* Buffer, _In_ size_t BufferLength);
 
-    VOID
-    SetMute
-    (
-        _In_ bool Value
-    )
+    VOID SetMute(_In_ bool Value)
     {
         m_Mute = Value;
     }
 
+    BOOL isBufferEmpty();
+    BOOL isBufferFull();
+    DWORD getUsedSize();
+    DWORD GetFrameAvailableCount();
+    DWORD GetFreeFrameCount();
+    DWORD AddFramesToBuffer(FMT_CHUNK* fmtHeader, BYTE* data, ULONG length);
+    DWORD GetFramesFromBuffer(_Out_writes_bytes_(BufferLength) BYTE* Buffer, _In_ size_t BufferLength);
+
 private:
-    VOID InitNewFrame
-    (
-        _Out_writes_bytes_(FrameSize)   BYTE*  Frame, 
-        _In_                            DWORD  FrameSize
-    );
-
-    //NTSTATUS OpenFileForRead(PCWSTR fileName);
-    //NTSTATUS OpenFileForWrite(PCWSTR fileName);
-
-    //void CloseFile(HANDLE fileHandle);
-
-    //NTSTATUS WriteFile(HANDLE fileHandle);
-
-    //IO_STATUS_BLOCK m_IOWriteStatusBlock = { 0 };
+    VOID InitNewFrame(_Out_writes_bytes_(FrameSize) BYTE* Frame, _In_ DWORD FrameSize);
 };
 
 #endif // _VIRTUALAUDIODEVICE_TONEGENERATOR_H
