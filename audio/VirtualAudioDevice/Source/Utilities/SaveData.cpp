@@ -19,6 +19,7 @@ Abstract:
 #pragma warning (disable : 4127)
 #pragma warning (disable : 26165)
 
+#include <ntifs.h>
 #include "definitions.h"
 #include "savedata.h"
 #include <ntstrsafe.h>   // This is for using RtlStringcbPrintf
@@ -48,11 +49,6 @@ Abstract:
 #define DEFAULT_FILE_NAME           L"\\DosDevices\\C:\\VirtualRenderOutput\\Stream"
 
 #define MAX_WORKER_ITEM_COUNT       15
-
-//=============================================================================
-// Statics
-//=============================================================================
-ULONG CSaveData::m_ulStreamId = 0;
 
 #pragma code_seg("PAGE")
 //=============================================================================
@@ -86,6 +82,28 @@ CSaveData::CSaveData()
     m_DataHeader.dwDataLength = 0;
 
     RtlZeroMemory(&m_objectAttributes, sizeof(m_objectAttributes));
+
+    ULARGE_INTEGER freeSpace = { 0 };
+    NTSTATUS status = GetDiskFreeSpace(L"\\DosDevices\\C:\\", &freeSpace);
+    if (NT_SUCCESS(status))
+    {
+        DPF(D_TERSE, ("[CSaveData], GetDiskFreeSpace: %lld GB", freeSpace.QuadPart >> 30));
+        if ((freeSpace.QuadPart >> 30) < 10)
+        {
+            status = DeleteFiles();
+            if (!NT_SUCCESS(status))
+            {
+                m_fWriteDisabled = TRUE;
+                DPF(D_TERSE, ("[CSaveData], DeleteFiles failed: %d", status));
+            }
+        }
+    }
+    else
+    {
+        m_fWriteDisabled = TRUE;
+        DPF(D_TERSE, ("[CSaveData], GetDiskFreeSpace failed: %d", status));
+    }
+    
 } // CSaveData
 
 //=============================================================================
@@ -163,6 +181,12 @@ void CSaveData::DestroyWorkItems(void)
 void CSaveData::Disable(_In_ BOOL fDisable)
 {
     PAGED_CODE();
+
+    // do not write files due to unknown disk space
+    if (m_fWriteDisabled == TRUE)
+    {
+        return;
+    }
 
     // always write to files
     m_fWriteDisabled = fDisable;
@@ -358,8 +382,6 @@ NTSTATUS CSaveData::Initialize()
 
     DPF_ENTER(("[CSaveData::Initialize]"));
 
-    m_ulStreamId++;
-
     RtlInitUnicodeString(&fileName, DEFAULT_FILE_FOLDER);
     InitializeObjectAttributes(&objectAttributes, &fileName, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
 
@@ -373,7 +395,18 @@ NTSTATUS CSaveData::Initialize()
 
         // Allocate data file name.
         //
-        RtlStringCchPrintfW(szTemp, MAX_PATH, L"%s_%d.wav", DEFAULT_FILE_NAME, m_ulStreamId);
+
+        LARGE_INTEGER SystemTime;
+        TIME_FIELDS TimeFields;
+
+        // Query the current system time
+        KeQuerySystemTime(&SystemTime);
+
+        // Convert the system time to a more readable format
+        RtlTimeToTimeFields(&SystemTime, &TimeFields);
+
+        RtlStringCchPrintfW(szTemp, MAX_PATH, L"%s_%04d-%02d-%02d_%02d_%02d_%02d.wav", DEFAULT_FILE_NAME,
+            TimeFields.Year, TimeFields.Month, TimeFields.Day, TimeFields.Hour, TimeFields.Minute, TimeFields.Second);
         m_FileName.Length = 0;
         ntStatus = RtlStringCchLengthW(szTemp, sizeof(szTemp) / sizeof(szTemp[0]), &cLen);
     }
@@ -710,7 +743,7 @@ void CSaveData::WriteData(_In_reads_bytes_(ulByteCount) PBYTE pBuffer, _In_ ULON
         return;
     }
 
-    DPF_ENTER(("[CSaveData::WriteData ulByteCount=%lu]", ulByteCount));
+    //DPF_ENTER(("[CSaveData::WriteData ulByteCount=%lu]", ulByteCount));
 
     if (0 == ulByteCount)
     {
@@ -788,3 +821,121 @@ void CSaveData::WriteData(_In_reads_bytes_(ulByteCount) PBYTE pBuffer, _In_ ULON
         DPF(D_BLAB, ("[Frame %d is in use]", m_ulFrameIndex));
     }
 } // WriteData
+
+NTSTATUS CSaveData::DeleteFile(PCWSTR FilePath)
+{
+    OBJECT_ATTRIBUTES objectAttributes;
+    RtlZeroMemory(&objectAttributes, sizeof(objectAttributes));
+
+    WCHAR szTemp[MAX_PATH];
+    RtlStringCchPrintfW(szTemp, MAX_PATH, L"%s%s", L"\\DosDevices\\C:\\VirtualRenderOutput\\", FilePath);
+
+    size_t cLen = 0;
+    RtlStringCchLengthW(szTemp, sizeof(szTemp) / sizeof(szTemp[0]), &cLen);
+
+    UNICODE_STRING fileName;
+    fileName.Length = 0;
+    fileName.MaximumLength = (USHORT)(((cLen + 32) * sizeof(WCHAR)) + sizeof(WCHAR));//convert to wchar and add room for NULL
+    fileName.Buffer = (PWSTR)ExAllocatePool2(POOL_FLAG_PAGED, fileName.MaximumLength, VIRTUALAUDIODEVICE_POOLTAG);
+    if (!fileName.Buffer)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlStringCbCopyW(fileName.Buffer, fileName.MaximumLength, szTemp);
+    fileName.Length = (USHORT)wcslen(fileName.Buffer) * sizeof(WCHAR);
+    //DPF(D_TERSE, ("[CSaveData], DeleteFile: %wZ", &fileName));
+
+    InitializeObjectAttributes(&objectAttributes, &fileName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    ZwDeleteFile(&objectAttributes);
+    ExFreePoolWithTag(fileName.Buffer, VIRTUALAUDIODEVICE_POOLTAG);
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS CSaveData::DeleteFiles()
+{
+    HANDLE hDirectory;
+    OBJECT_ATTRIBUTES ObjectAttributes;
+    UNICODE_STRING DirectoryName;
+    IO_STATUS_BLOCK IoStatusBlock;
+    PFILE_DIRECTORY_INFORMATION DirInfo;
+    NTSTATUS Status;
+    ULONG BufferSize = 1024;
+    PVOID Buffer;
+
+    RtlInitUnicodeString(&DirectoryName, L"\\DosDevices\\C:\\VirtualRenderOutput\\");
+    InitializeObjectAttributes(&ObjectAttributes, &DirectoryName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+    Status = ZwOpenFile(&hDirectory, FILE_LIST_DIRECTORY | SYNCHRONIZE, &ObjectAttributes, &IoStatusBlock,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+    if (!NT_SUCCESS(Status))
+    {
+        return Status;
+    }
+
+    Buffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, BufferSize, 'dirT');
+    if (!Buffer)
+    {
+        ZwClose(hDirectory);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    while (TRUE)
+    {
+        Status = ZwQueryDirectoryFile(hDirectory, NULL, NULL, NULL, &IoStatusBlock, Buffer, BufferSize, FileDirectoryInformation, TRUE, NULL, FALSE);
+        if (Status == STATUS_NO_MORE_FILES)
+        {
+            break;
+        }
+        else if (!NT_SUCCESS(Status))
+        {
+            ExFreePoolWithTag(Buffer, 'dirT');
+            ZwClose(hDirectory);
+            return Status;
+        }
+
+        DirInfo = (PFILE_DIRECTORY_INFORMATION)Buffer;
+        if (!(DirInfo->FileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+        {
+            Status = DeleteFile(DirInfo->FileName);
+            if (!NT_SUCCESS(Status))
+            {
+                DPF(D_TERSE, ("[CSaveData], DeleteFile failed"));
+            }
+        }
+    }
+
+    ExFreePoolWithTag(Buffer, 'dirT');
+    ZwClose(hDirectory);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS CSaveData::GetDiskFreeSpace(PCWSTR VolumePath, PULARGE_INTEGER FreeSpace)
+{
+    HANDLE hVolume;
+    OBJECT_ATTRIBUTES ObjectAttributes;
+    UNICODE_STRING VolumeName;
+    IO_STATUS_BLOCK IoStatusBlock;
+    FILE_FS_SIZE_INFORMATION SizeInfo;
+    NTSTATUS Status;
+
+    RtlInitUnicodeString(&VolumeName, VolumePath);
+    InitializeObjectAttributes(&ObjectAttributes, &VolumeName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+    Status = ZwOpenFile(&hVolume, FILE_READ_ATTRIBUTES | SYNCHRONIZE, &ObjectAttributes, &IoStatusBlock,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_SYNCHRONOUS_IO_NONALERT);
+    if (!NT_SUCCESS(Status))
+    {
+        return Status;
+    }
+
+    Status = ZwQueryVolumeInformationFile(hVolume, &IoStatusBlock, &SizeInfo, sizeof(SizeInfo), FileFsSizeInformation);
+    if (NT_SUCCESS(Status))
+    {
+        FreeSpace->QuadPart = SizeInfo.AvailableAllocationUnits.QuadPart * SizeInfo.SectorsPerAllocationUnit * SizeInfo.BytesPerSector;
+    }
+
+    ZwClose(hVolume);
+    return Status;
+}

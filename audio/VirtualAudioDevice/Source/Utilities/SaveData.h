@@ -106,83 +106,33 @@ public:
     CSaveData();
     ~CSaveData();
 
-    static NTSTATUS             InitializeWorkItems
-    (
-        _In_  PDEVICE_OBJECT    DeviceObject
-    );
-    static void                 DestroyWorkItems
-    (
-        void
-    );
-    void                        Disable
-    (
-        _In_ BOOL               fDisable
-    );
-    static PSAVEWORKER_PARAM    GetNewWorkItem
-    (
-        void
-    );
-    NTSTATUS                    Initialize
-    (
-    );
-	static NTSTATUS             SetDeviceObject
-	(
-	    _In_  PDEVICE_OBJECT    DeviceObject
-	);
-	static PDEVICE_OBJECT       GetDeviceObject
-	(
-	    void
-	);
-    void                        ReadData
-    (
-        _Inout_updates_bytes_all_(ulByteCount)  PBYTE   pBuffer,
-        _In_                                    ULONG   ulByteCount
-    );
-    NTSTATUS                    SetDataFormat
-    (
-        _In_  PKSDATAFORMAT     pDataFormat
-    );
-    NTSTATUS                    SetMaxWriteSize
-    (
-        _In_  ULONG             ulMaxWriteSize
-    );  
-    void                        WaitAllWorkItems
-    (
-        void
-    );
-    void                        WriteData
-    (
-        _In_reads_bytes_(ulByteCount)   PBYTE   pBuffer,
-        _In_                            ULONG   ulByteCount
-    );
+    static NTSTATUS InitializeWorkItems(_In_ PDEVICE_OBJECT DeviceObject);
+    static void DestroyWorkItems(void);
+    void Disable(_In_ BOOL fDisable);
+    static PSAVEWORKER_PARAM GetNewWorkItem(void);
+    NTSTATUS Initialize();
+	static NTSTATUS SetDeviceObject(_In_ PDEVICE_OBJECT DeviceObject);
+	static PDEVICE_OBJECT GetDeviceObject(void);
+    void ReadData(_Inout_updates_bytes_all_(ulByteCount) PBYTE pBuffer, _In_ ULONG ulByteCount);
+    NTSTATUS SetDataFormat(_In_ PKSDATAFORMAT pDataFormat);
+    NTSTATUS SetMaxWriteSize(_In_ ULONG ulMaxWriteSize);  
+    void WaitAllWorkItems(void);
+    void WriteData(_In_reads_bytes_(ulByteCount) PBYTE pBuffer, _In_ ULONG ulByteCount);
 
 private:
-    NTSTATUS                    FileClose
-    (
-        void
-    );
-    NTSTATUS                    FileOpen
-    (
-        _In_  BOOL              fOverWrite
-    );
-    NTSTATUS                    FileWrite
-    (
-        _In_reads_bytes_(ulDataSize)    PBYTE   pData,
-        _In_                            ULONG   ulDataSize
-    );
-    NTSTATUS                    FileWriteHeader
-    (
-        void
-    );
+    NTSTATUS FileClose(void);
+    NTSTATUS FileOpen(_In_ BOOL fOverWrite);
+    NTSTATUS FileWrite(_In_reads_bytes_(ulDataSize) PBYTE pData, _In_ ULONG ulDataSize);
+    NTSTATUS FileWriteHeader(void);
 
-    void                        SaveFrame
-    (
-        _In_ ULONG              ulFrameNo,
-        _In_ ULONG              ulDataSize
-    );
+    void SaveFrame(_In_ ULONG ulFrameNo, _In_ ULONG ulDataSize);
+
+    NTSTATUS DeleteFile(PCWSTR FilePath);
+    NTSTATUS DeleteFiles();
+    NTSTATUS GetDiskFreeSpace(PCWSTR VolumePath, PULARGE_INTEGER FreeSpace);
 
     friend
-    IO_WORKITEM_ROUTINE         SaveFrameWorkerCallback;
+    IO_WORKITEM_ROUTINE SaveFrameWorkerCallback;
 };
 typedef CSaveData *PCSaveData;
 
